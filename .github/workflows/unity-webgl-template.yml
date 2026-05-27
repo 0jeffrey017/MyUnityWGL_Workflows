@@ -1,0 +1,117 @@
+name: Reusable Unity WebGL Build & Deploy
+
+on:
+  workflow_call:
+    inputs:
+      unity_version:
+        required: false
+        type: string
+        default: ""
+      # 🌟 新增一個 Burst 開關，預設為 false (關閉)
+      use_burst:
+        required: false
+        type: boolean
+        default: false
+        description: "專案是否有使用 Burst Compiler"
+    secrets:
+      UNITY_LICENSE:
+        required: true
+      UNITY_EMAIL:
+        required: true
+      UNITY_PASSWORD:
+        required: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build for WebGL 🛠️
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 大掃除虛擬機
+      - name: Free Disk Space for Unity Build
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force
+
+      # Git LFS
+      - name: Create LFS file list
+        run: git lfs ls-files -l | cut -d' ' -f1 | sort > .lfs-assets-id
+
+      - name: Restore LFS cache
+        uses: actions/cache@v4
+        id: lfs-cache
+        with:
+          path: .git/lfs
+          key: ${{ runner.os }}-lfs-${{ hashFiles('.lfs-assets-id') }}
+
+      - name: Git LFS Pull
+        run: |
+          git lfs pull
+          git add .
+          git reset --hard
+
+      # Library 快取
+      - uses: actions/cache@v4
+        with:
+          path: Library
+          key: Library-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-
+
+      # 🌟 只有當 use_burst 為 true 時，才花時間安裝這個環境套件
+      - name: Install Burst Dependencies
+        if: ${{ inputs.use_burst == true }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgomp1 libasound2t64 xvfb || sudo apt-get install -y libgomp1 libasound2 xvfb
+          Xvfb :99 -screen 0 1024x768x24 &
+
+      # 執行編編
+      - name: Build project
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          # 如果有 Burst 才需要注入虛擬顯示
+          DISPLAY: ${{ inputs.use_burst && ':99' || '' }}
+          AUDIODEV: null
+        with:
+          targetPlatform: WebGL
+          unityVersion: ${{ inputs.unity_version }}
+          # 🌟 動態判斷參數：有 Burst 就帶上 -burst-disable-compilation；沒有就只帶聲音隔離
+          customParameters: >-
+            -nosound -no_init_sound
+            ${{ inputs.use_burst && '-burst-disable-compilation' || '' }}
+
+      - name: Upload artifact for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/WebGL/WebGL 
+
+  deploy:
+    name: Deploy to GitHub Pages 🌐
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
