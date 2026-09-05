@@ -35,10 +35,14 @@ jobs:
     name: Build for WebGL 🛠️
     runs-on: ubuntu-latest
     steps:
+      - name: Check working tree changes
+        run: |
+          git status --short
+          git diff --stat
+          git diff
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      # 大掃除虛擬機
+        
       - name: Free Disk Space for Unity Build
         run: |
           sudo rm -rf /usr/share/dotnet
