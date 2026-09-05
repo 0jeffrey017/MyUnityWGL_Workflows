@@ -35,6 +35,9 @@ jobs:
     name: Build for WebGL 🛠️
     runs-on: ubuntu-latest
     steps:
+      - name: Reset Unity Settings
+        run: git checkout -- ProjectSettings/
+        
       - name: Checkout repository
         uses: actions/checkout@v4
         
