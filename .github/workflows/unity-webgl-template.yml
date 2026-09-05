@@ -35,13 +35,6 @@ jobs:
     name: Build for WebGL 🛠️
     runs-on: ubuntu-latest
     steps:
-      - name: Check working tree changes
-        working-directory: ${{ github.workspace }}
-        run: |
-          pwd
-          git status --short
-          git diff --stat
-          git diff
       - name: Checkout repository
         uses: actions/checkout@v4
         
