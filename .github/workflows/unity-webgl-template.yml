@@ -1,119 +1,218 @@
-name: Reusable Unity WebGL Build & Deploy
+name: Reusable Unity WebGL
 
 on:
   workflow_call:
     inputs:
-      unity_version:
-        required: false
+      project_path:
+        description: Repository-relative Unity project directory
         type: string
-        default: ""
-      # 🌟 新增一個 Burst 開關，預設為 false (關閉)
+        default: .
+      unity_version:
+        description: Exact Editor version; empty reads ProjectVersion.txt
+        type: string
+        default: ''
+      cli_version:
+        description: Official Unity CLI release, or latest
+        type: string
+        default: latest
       use_burst:
-        required: false
+        description: Keep normal Burst compilation; false passes --burst-disable-compilation
         type: boolean
         default: false
-        description: "專案是否有使用 Burst Compiler"
+      deploy:
+        description: Publish only on pushes to main or master
+        type: boolean
+        default: false
     secrets:
       UNITY_LICENSE:
-        required: true
-      UNITY_EMAIL:
-        required: true
-      UNITY_PASSWORD:
+        description: Raw ULF contents valid for this runner and licensed for unattended builds
         required: true
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
+permissions: {}
 
 jobs:
   build:
-    name: Build for WebGL 🛠️
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      UNITY_NON_INTERACTIVE: '1'
+      UNITY_NO_PAGER: '1'
+      UNITY_NO_BANNER: '1'
     steps:
-      - name: Reset Unity Settings
-        run: git checkout -- ProjectSettings/
-        
-      - name: Checkout repository
+      - name: Checkout source and LFS assets
         uses: actions/checkout@v4
-        
-      - name: Free Disk Space for Unity Build
+        with:
+          lfs: true
+          clean: false
+          persist-credentials: false
+
+      - name: Resolve project and exact Editor version
+        id: project
+        env:
+          PROJECT_INPUT: ${{ inputs.project_path }}
+          EDITOR_INPUT: ${{ inputs.unity_version }}
+          CLI_INPUT: ${{ inputs.cli_version }}
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          docker image prune --all --force
+          CI_DIAGNOSTICS="$RUNNER_TEMP/unity-diagnostics"
+          echo "CI_DIAGNOSTICS=$CI_DIAGNOSTICS" >> "$GITHUB_ENV"
+          echo "CI_WEBGL_OUTPUT=$RUNNER_TEMP/webgl-site" >> "$GITHUB_ENV"
+          mkdir -p "$CI_DIAGNOSTICS"
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          relative = pathlib.Path(os.environ['PROJECT_INPUT'])
+          if relative.is_absolute() or any(c in str(relative) for c in '\r\n'):
+              raise SystemExit('project_path must be a repository-relative path')
+          project = (root / relative).resolve()
+          if not project.is_relative_to(root):
+              raise SystemExit('project_path must stay within the checkout')
+          version_file = project / 'ProjectSettings/ProjectVersion.txt'
+          match = re.search(r'^m_EditorVersion:\s*(\S+)\s*$', version_file.read_text(), re.M)
+          version = os.environ['EDITOR_INPUT'] or (match.group(1) if match else '')
+          if not re.fullmatch(r'\d+\.\d+\.\d+[abfp]\d+', version):
+              raise SystemExit('Use an exact Editor version, e.g. 6000.3.8f1')
+          cli = os.environ['CLI_INPUT']
+          if cli != 'latest' and not re.fullmatch(r'v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?', cli):
+              raise SystemExit('cli_version must be latest or an exact CLI release')
+          if not (project / 'Assets/_Project/Editor/CI/WebGLBuild.cs').is_file():
+              raise SystemExit('Selected project must contain the ProjectDefense WebGL build method')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'path={project}\nversion={version}\n')
+              output.write(f'cache_scope={hashlib.sha256(str(relative).encode()).hexdigest()[:12]}\n')
+          print(f'Project: {project}; Editor: {version}; CLI: {cli}')
+          PY
+          git lfs fsck
 
-      # Git LFS
-      - name: Create LFS file list
-        run: git lfs ls-files -l | cut -d' ' -f1 | sort > .lfs-assets-id
+      - name: Install official Unity CLI
+        timeout-minutes: 10
+        env:
+          CLI_VERSION: ${{ inputs.cli_version }}
+        run: |
+          curl --fail --silent --show-error --location --retry 3 https://unity.com/install.sh -o "$RUNNER_TEMP/install-unity-cli.sh"
+          bash "$RUNNER_TEMP/install-unity-cli.sh" | tee "$CI_DIAGNOSTICS/cli-install.log"
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [[ "$CLI_VERSION" != latest ]]; then
+            unity self-update --target "$CLI_VERSION" --yes --non-interactive
+          fi
+          unity version --format json > "$CI_DIAGNOSTICS/cli-version.json"
+          unity build --help > "$CI_DIAGNOSTICS/build-help.txt"
+          unity install --help > "$CI_DIAGNOSTICS/install-help.txt"
 
-      - name: Restore LFS cache
+      - name: Install matching Editor and WebGL module
+        timeout-minutes: 30
+        env:
+          EDITOR_VERSION: ${{ steps.project.outputs.version }}
+        run: |
+          unity install "$EDITOR_VERSION" --module webgl --child-modules --yes --accept-eula --non-interactive | tee "$CI_DIAGNOSTICS/editor-install.log"
+
+      - name: Restore Library cache
         uses: actions/cache@v4
-        id: lfs-cache
         with:
-          path: .git/lfs
-          key: ${{ runner.os }}-lfs-${{ hashFiles('.lfs-assets-id') }}
-
-      - name: Git LFS Pull
-        run: |
-          git lfs pull
-          git add .
-          git reset --hard
-
-      # Library 快取
-      - uses: actions/cache@v4
-        with:
-          path: Library
-          key: Library-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          path: ${{ steps.project.outputs.path }}/Library
+          key: UnityLibrary-${{ runner.os }}-${{ steps.project.outputs.cache_scope }}-${{ steps.project.outputs.version }}-WebGL-burst-${{ inputs.use_burst }}-${{ hashFiles(format('{0}/Packages/**', inputs.project_path), format('{0}/ProjectSettings/**', inputs.project_path)) }}-${{ hashFiles(format('{0}/Assets/**', inputs.project_path)) }}
           restore-keys: |
-            Library-
+            UnityLibrary-${{ runner.os }}-${{ steps.project.outputs.cache_scope }}-${{ steps.project.outputs.version }}-WebGL-burst-${{ inputs.use_burst }}-${{ hashFiles(format('{0}/Packages/**', inputs.project_path), format('{0}/ProjectSettings/**', inputs.project_path)) }}-
 
-      # 🌟 只有當 use_burst 為 true 時，才花時間安裝這個環境套件
-      - name: Install Burst Dependencies
-        if: ${{ inputs.use_burst == true }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgomp1 libasound2t64 xvfb || sudo apt-get install -y libgomp1 libasound2 xvfb
-          Xvfb :99 -screen 0 1024x768x24 &
-
-      # 執行編編
-      - name: Build project
-        uses: game-ci/unity-builder@v4
+      - name: Activate offline ULF license
+        id: license
+        timeout-minutes: 5
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-          # 如果有 Burst 才需要注入虛擬顯示
-          DISPLAY: ${{ inputs.use_burst && ':99' || '' }}
-          AUDIODEV: null
-        with:
-          targetPlatform: WebGL
-          unityVersion: ${{ inputs.unity_version }}
-          # 🌟 動態判斷參數：有 Burst 就帶上 -burst-disable-compilation；沒有就只帶聲音隔離
-          customParameters: >-
-            -nosound -no_init_sound
-            ${{ inputs.use_burst && '-burst-disable-compilation' || '' }}
+        run: |
+          set +x
+          umask 077
+          license_file="$RUNNER_TEMP/ci-unity-license.ulf"
+          printf '%s' "$UNITY_LICENSE" > "$license_file"
+          if [[ ! -s "$license_file" ]]; then
+            echo 'UNITY_LICENSE is empty; trusted callers must supply a valid ULF secret.' >&2
+            exit 1
+          fi
+          echo 'attempted=true' >> "$GITHUB_OUTPUT"
+          if ! timeout 180 unity license activate --file "$license_file" --non-interactive > "$RUNNER_TEMP/unity-activation-private.log" 2>&1; then
+            echo 'Offline Unity license activation failed. Check ULF runner identity and entitlement; licensing output is withheld.' >&2
+            exit 1
+          fi
 
-      - name: Upload artifact for Pages
+      - name: Build WebGL with official Unity CLI
+        timeout-minutes: 40
+        env:
+          PROJECT_PATH: ${{ steps.project.outputs.path }}
+          EDITOR_VERSION: ${{ steps.project.outputs.version }}
+          USE_BURST: ${{ inputs.use_burst }}
+        run: |
+          args=()
+          if [[ "$USE_BURST" != true ]]; then
+            args+=(--args '--burst-disable-compilation')
+          fi
+          unity build "$PROJECT_PATH" \
+            --editor-version "$EDITOR_VERSION" \
+            --target WebGL \
+            --execute-method ProjectDefense.Editor.CI.WebGLBuild.Build \
+            --output-path "$CI_WEBGL_OUTPUT" \
+            --log-file "$CI_DIAGNOSTICS/webgl-build.log" \
+            --provenance-path "$CI_DIAGNOSTICS/build-provenance.json" \
+            --timeout 2100 --no-tail --non-interactive "${args[@]}"
+          test -s "$CI_WEBGL_OUTPUT/index.html"
+
+      - name: Return license and remove private files
+        if: always()
+        timeout-minutes: 5
+        env:
+          ACTIVATION_ATTEMPTED: ${{ steps.license.outputs.attempted }}
+        run: |
+          set +x
+          trap 'rm -f -- "$RUNNER_TEMP/ci-unity-license.ulf" "$RUNNER_TEMP/unity-activation-private.log" "$RUNNER_TEMP/unity-return-private.log"' EXIT
+          if [[ "$ACTIVATION_ATTEMPTED" == true ]]; then
+            if ! timeout 180 unity license return --yes --non-interactive > "$RUNNER_TEMP/unity-return-private.log" 2>&1; then
+              echo 'Unity license return failed; check seat status with the license administrator. Private files will still be removed.' >&2
+              exit 1
+            fi
+          fi
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-webgl-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/unity-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload WebGL build
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-webgl-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/webgl-site/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Prepare Pages artifact
+        if: inputs.deploy && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         uses: actions/upload-pages-artifact@v3
         with:
-          path: build/WebGL/WebGL 
+          path: ${{ runner.temp }}/webgl-site/
 
   deploy:
-    name: Deploy to GitHub Pages 🌐
     needs: build
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    runs-on: ubuntu-latest
+    if: inputs.deploy && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: unity-webgl-pages-${{ github.repository }}
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy to GitHub Pages
+      - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@v4
